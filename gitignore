@@ -1,0 +1,12 @@
+# NEVER upload these to GitHub
+.env
+*.env
+*.log
+*.json
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+price_history.json
+trades_log.json
+open_positions.json
