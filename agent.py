@@ -645,9 +645,73 @@ FALLBACK_STOCKS = [
     {"symbol":"LBBL", "ltp":234, "change":3.1,"volume":19800,"high":238,"low":228,"previousClose":227,"sector":"Dev Bank","pe":12.8,"eps":18.3,"52weekHigh":278,"52weekLow":162},
 ]
 
+# Known NEPSE stock symbols for ShareBazaar per-symbol fetching
+NEPSE_SYMBOLS = [
+    "NABIL","NMB","NICA","SANIMA","GBIME","ADBL","PCBL","SRBL","NBL","HBL",
+    "HIDCL","CHCL","UPPER","SHPC","NHPC","AKPL","RURU","KPCL","BPCL","SPDL",
+    "NLIC","PLIC","LICN","AIL","SGIC","NLG","HGI","UAIL","PRIN","SNLI",
+    "LBBL","MLBL","SHINE","KRBL","EDBL","GRDBL","KMCDB","SABSL","VLUCL",
+    "NIFRA","CEDB","JOSHI","SBCF","SEF","NMFBS"
+]
+
 def fetch_stocks() -> list:
     global _data_source
-    # Source 1: nepalstock.com today-price
+
+    # Source 1: surajrimal07 NepseAPI (Oracle Cloud India - not blocked)
+    try:
+        r = requests.get(
+            "https://nepseapi.surajrimal.dev/api/live",
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+            timeout=15
+        )
+        if r.ok:
+            d = r.json()
+            stocks = d if isinstance(d, list) else d.get("data") or d.get("result") or []
+            valid = [normalize_stock(s) for s in stocks if sf(s.get("ltp") or s.get("lastTradedPrice") or s.get("close")) > 0]
+            if len(valid) >= 5:
+                logger.info(f"✅ surajrimal NepseAPI: {len(valid)} stocks")
+                _data_source = "surajrimal NepseAPI (live)"
+                return valid
+    except Exception as e:
+        logger.warning(f"surajrimal NepseAPI: {e}")
+
+    # Source 2: ShareBazaar Cloudflare Workers (globally distributed - works from any cloud)
+    try:
+        r = requests.get(
+            "https://nepsetty.kokomo.workers.dev/api/all",
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+            timeout=15
+        )
+        if r.ok:
+            d = r.json()
+            stocks = d if isinstance(d, list) else d.get("data") or []
+            valid = [normalize_stock(s) for s in stocks if sf(s.get("ltp") or s.get("price") or s.get("close")) > 0]
+            if len(valid) >= 5:
+                logger.info(f"✅ ShareBazaar CDN: {len(valid)} stocks")
+                _data_source = "ShareBazaar CDN (live)"
+                return valid
+    except Exception as e:
+        logger.warning(f"ShareBazaar CDN: {e}")
+
+    # Source 3: merolagani with mobile User-Agent
+    try:
+        r = requests.get(
+            "https://merolagani.com/handlers/webrequesthandler.ashx?type=market_summary",
+            headers={"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15"},
+            timeout=15
+        )
+        if r.ok and r.text.strip().startswith("["):
+            d = r.json()
+            if isinstance(d, list) and len(d) >= 5:
+                valid = [normalize_stock(s) for s in d if sf(s.get("ltp") or s.get("lastTradedPrice")) > 0]
+                if len(valid) >= 5:
+                    logger.info(f"✅ merolagani (mobile UA): {len(valid)} stocks")
+                    _data_source = "merolagani (live)"
+                    return valid
+    except Exception as e:
+        logger.warning(f"merolagani: {e}")
+
+    # Source 4: nepalstock.com today-price
     data = nepse_get("/nepse-data/today-price", {"size": 500})
     if data:
         content = data if isinstance(data, list) else data.get("content") or data.get("data") or []
@@ -693,16 +757,50 @@ def fetch_stocks() -> list:
     except Exception as e:
         logger.warning(f"sharebazaar: {e}")
 
+    # Last resort: try nepse alpha public API
+    try:
+        r = requests.get(
+            "https://nepse-data-api.herokuapp.com/data/today-price",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=15
+        )
+        if r.ok:
+            d = r.json()
+            stocks = d if isinstance(d, list) else d.get("data", [])
+            valid = [normalize_stock(s) for s in stocks if sf(s.get("ltp") or s.get("lastTradedPrice")) > 0]
+            if len(valid) >= 5:
+                logger.info(f"✅ nepse-alpha: {len(valid)} stocks")
+                _data_source = "nepse-alpha (live)"
+                return valid
+    except Exception as e:
+        logger.warning(f"nepse-alpha: {e}")
+
     logger.error("⚠️ ALL LIVE DATA SOURCES FAILED — using sample data. DO NOT TRADE ON THIS!")
     _data_source = "⚠️ SAMPLE DATA - DO NOT TRADE"
     return FALLBACK_STOCKS
 
 def fetch_floorsheet() -> list:
     """
-    Fetch today's floorsheet from nepalstock.com (multi-page).
+    Fetch today's floorsheet - same data Hamroshare shows.
     Every trade: stock, buyer broker, seller broker, qty, price.
-    Same data Hamroshare shows in their app.
     """
+    # Source 1: surajrimal NepseAPI (cloud-friendly, Oracle India)
+    try:
+        r = requests.get(
+            "https://nepseapi.surajrimal.dev/api/floorsheet",
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+            timeout=20
+        )
+        if r.ok:
+            d = r.json()
+            trades = d if isinstance(d, list) else d.get("data") or d.get("floorsheet") or []
+            if isinstance(trades, list) and len(trades) > 0:
+                logger.info(f"✅ Floorsheet (surajrimal): {len(trades)} trades")
+                atomic_write(FLOOR_CACHE, {"date": get_nst().strftime("%Y-%m-%d"), "data": trades})
+                return trades
+    except Exception as e:
+        logger.warning(f"surajrimal floorsheet: {e}")
+
+    # Source 2: nepalstock.com multi-page
     all_trades = []
     for page in range(5):  # fetch up to 5 pages of 500 trades = 2500 trades max
         data = nepse_get("/nepse-data/floorsheet", {"size": 500, "page": page})
@@ -798,17 +896,311 @@ def analyze_floorsheet(floorsheet: list) -> dict:
 _news_cache: dict = {"ts": 0, "data": ""}
 NEWS_CACHE_TTL = 1800  # 30 minutes
 
+def fetch_realtime_context() -> dict:
+    """
+    Fetch real-time signals that actually move NEPSE:
+    - India market sentiment (Sensex/Nifty correlation)
+    - USD/NPR forex (pegged to INR, affects trade deficit)
+    - NRB data signals
+    - Corporate announcements (dividends, book closures, bonus)
+    - Social/political sentiment
+    Returns structured dict for AI consumption.
+    """
+    context = {
+        "india_market":       fetch_india_market(),
+        "forex":              fetch_forex(),
+        "corporate_actions":  fetch_corporate_actions(),
+        "nrb_signals":        fetch_nrb_signals(),
+        "political_context":  get_political_context(),
+        "seasonal_context":   get_seasonal_context(),
+    }
+    return context
+
+
+def fetch_india_market() -> dict:
+    """Sensex/Nifty — NEPSE correlates strongly with Indian markets."""
+    try:
+        # Yahoo Finance API (free, no key)
+        r = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/%5ENSEI?interval=1d&range=5d",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=10
+        )
+        if r.ok:
+            data = r.json()
+            result = data.get("chart", {}).get("result", [{}])[0]
+            meta   = result.get("meta", {})
+            price  = meta.get("regularMarketPrice", 0)
+            prev   = meta.get("chartPreviousClose", price)
+            chg    = round((price - prev) / prev * 100, 2) if prev else 0
+            signal = "bullish" if chg > 0.5 else ("bearish" if chg < -0.5 else "neutral")
+            return {
+                "nifty_price":  round(price, 2),
+                "nifty_change": chg,
+                "signal":       signal,
+                "nepse_impact": "NEPSE likely up" if chg > 1 else ("NEPSE likely down" if chg < -1 else "neutral impact"),
+            }
+    except Exception as e:
+        logger.warning(f"India market fetch: {e}")
+
+    # Fallback: Sensex via BSE
+    try:
+        r = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/%5EBSESN?interval=1d&range=2d",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=10
+        )
+        if r.ok:
+            data = r.json()
+            meta = data.get("chart",{}).get("result",[{}])[0].get("meta",{})
+            price = meta.get("regularMarketPrice",0)
+            prev  = meta.get("chartPreviousClose", price)
+            chg   = round((price-prev)/prev*100,2) if prev else 0
+            return {"sensex_price": round(price,2), "sensex_change": chg,
+                    "signal": "bullish" if chg>0.5 else ("bearish" if chg<-0.5 else "neutral")}
+    except Exception as e:
+        logger.warning(f"Sensex fetch: {e}")
+
+    return {"signal": "unknown", "note": "India market data unavailable"}
+
+
+def fetch_forex() -> dict:
+    """USD/NPR and INR/NPR rates — NPR is pegged to INR at 1.6."""
+    try:
+        r = requests.get(
+            "https://www.hamropatro.com/api/forex",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=10
+        )
+        if r.ok:
+            data = r.json()
+            rates = data if isinstance(data, list) else data.get("data") or data.get("rates") or []
+            result = {}
+            for item in rates:
+                currency = item.get("currency","").upper()
+                buy = sf(item.get("buying") or item.get("buy"))
+                sell = sf(item.get("selling") or item.get("sell"))
+                if currency in ("USD","INR","EUR","GBP"):
+                    result[currency] = {"buy": buy, "sell": sell}
+            if result:
+                # Interpret USD/NPR for NEPSE impact
+                usd_sell = result.get("USD",{}).get("sell",0)
+                if usd_sell > 0:
+                    result["nepse_impact"] = (
+                        "NPR weakening (imports costlier, trade deficit wider) - mild negative" if usd_sell > 135
+                        else "NPR stable - neutral"
+                    )
+                return result
+    except Exception as e:
+        logger.warning(f"Forex fetch: {e}")
+
+    # Fallback: NRB forex
+    try:
+        r = requests.get(
+            "https://www.nrb.org.np/api/forex/v1/rates",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=10
+        )
+        if r.ok:
+            data = r.json()
+            rates = data.get("data",{}).get("payload",[])
+            result = {}
+            for item in rates:
+                cur = item.get("currency",{}).get("iso3","")
+                if cur in ("USD","INR"):
+                    result[cur] = {
+                        "buy":  sf(item.get("buy")),
+                        "sell": sf(item.get("sell")),
+                    }
+            if result:
+                return result
+    except Exception as e:
+        logger.warning(f"NRB forex: {e}")
+
+    return {"note": "Forex data unavailable"}
+
+
+def fetch_corporate_actions() -> list:
+    """
+    Fetch upcoming book closures, dividends, bonus shares, AGMs.
+    These are massive NEPSE price movers — stocks rally 5-15% before book closure.
+    """
+    actions = []
+    try:
+        r = requests.get(
+            "https://merolagani.com/handlers/webrequesthandler.ashx?type=upcoming_dividends",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=10
+        )
+        if r.ok:
+            data = r.json()
+            items = data if isinstance(data, list) else data.get("data") or []
+            for item in items[:10]:
+                symbol      = item.get("symbol") or item.get("stockSymbol","")
+                book_close  = item.get("bookCloseDate") or item.get("bookClose","")
+                dividend    = item.get("dividend") or item.get("cashDividend","")
+                bonus       = item.get("bonus") or item.get("bonusShare","")
+                if symbol:
+                    actions.append({
+                        "symbol":         symbol,
+                        "book_close_date": book_close,
+                        "cash_dividend":  dividend,
+                        "bonus_share":    bonus,
+                        "days_until_close": _days_until(book_close),
+                    })
+            if actions:
+                logger.info(f"Corporate actions: {len(actions)} upcoming dividends/bonuses")
+                return actions
+    except Exception as e:
+        logger.warning(f"Corporate actions: {e}")
+
+    # Try sharesansar
+    try:
+        r = requests.get(
+            "https://www.sharesansar.com/category/dividend",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=10
+        )
+        if r.ok and "symbol" in r.text.lower():
+            # Parse basic dividend info
+            symbols = re.findall(r'<td[^>]*>([A-Z]{2,8})</td>', r.text)
+            if symbols:
+                return [{"symbol": s, "note": "upcoming dividend - check sharesansar.com"} for s in symbols[:5]]
+    except Exception as e:
+        logger.warning(f"sharesansar dividends: {e}")
+
+    return []
+
+
+def _days_until(date_str: str) -> int:
+    """Calculate days until a date string."""
+    if not date_str:
+        return 999
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d"):
+        try:
+            target = datetime.strptime(str(date_str)[:10], fmt).date()
+            return (target - get_nst().date()).days
+        except Exception:
+            pass
+    return 999
+
+
+def fetch_nrb_signals() -> dict:
+    """Fetch NRB monetary policy signals and banking sector data."""
+    signals = {
+        "policy_rate":     5.5,   # current NRB policy rate
+        "deposit_rate":    "below 3% (pushing insurers to equities)",
+        "credit_growth":   "moderate",
+        "liquidity":       "adequate",
+        "npl_ratio":       3.2,
+        "fx_reserves_usd": 20.0,  # billion
+        "signal":          "accommodative - positive for equities",
+        "note":            "NRB data updated from known context (March 2026)",
+    }
+    # Try fetching latest from NRB
+    try:
+        r = requests.get(
+            "https://www.nrb.org.np/api/statistics/v1/key-indicators",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=10
+        )
+        if r.ok:
+            data = r.json()
+            payload = data.get("data",{}).get("payload",{})
+            if payload:
+                signals.update({"live_data": True, "raw": str(payload)[:200]})
+    except Exception as e:
+        logger.warning(f"NRB data: {e}")
+    return signals
+
+
+def get_political_context() -> dict:
+    """Current Nepal political context — heavily influences NEPSE."""
+    now = get_nst()
+    month = now.month
+
+    return {
+        "current_situation": "Post-election March 2026. RSP dominant. Balen Shah expected PM.",
+        "finance_minister":  "Dr. Swarnim Wagle (economist) expected — market very positive",
+        "market_sentiment":  "Political clarity = bullish. NEPSE gained 57-162 pts on optimism.",
+        "key_risks": [
+            "Coalition instability if RSP doesn't form government cleanly",
+            "FATF grey list limiting FDI",
+            "Trade deficit widening",
+        ],
+        "upcoming_catalysts": [
+            "New government formation — major market catalyst",
+            "Budget announcement (expected Ashad/July) — watch for hydro subsidies",
+            "Arun 3 + Upper Trishuli commissioning 2026",
+        ],
+        "india_nepal_relations": "Stable. Power export agreements advancing. Positive for hydro.",
+        "china_nepal":           "BRI projects progressing slowly. Long-term FDI signal.",
+    }
+
+
+def get_seasonal_context() -> dict:
+    """Nepal seasonal factors that move markets."""
+    now   = get_nst()
+    month = now.month
+    day   = now.day
+
+    # Determine current season context
+    if month in (3, 4, 5):   # March-May = pre-monsoon dry
+        hydro_note = "DRY SEASON: hydro generation 40-60% of peak. Revenue lower."
+        remit_note = "Moderate remittance inflow. Pre-summer labor migration peak."
+    elif month in (6, 7, 8, 9, 10):  # June-Oct = monsoon/wet
+        hydro_note = "WET SEASON: hydro generation at peak. Revenue surge."
+        remit_note = "Pre-Dashain remittance surge (Sep-Oct) = retail buying surge."
+    else:  # Nov-Feb = post-monsoon dry
+        hydro_note = "DRY SEASON: hydro generation declining from monsoon peak."
+        remit_note = "Post-Tihar. Moderate remittances. Festival spending settling."
+
+    # Festival proximity
+    festivals = []
+    if month == 10 and 1 <= day <= 31:
+        festivals.append("Dashain/Tihar season: highest consumer spending. Remittance peak. Retail NEPSE buying surge.")
+    if month == 4 and day <= 20:
+        festivals.append("Nepal New Year approaching (Baisakh 1). Market closed 1-2 days.")
+    if month == 7 and day >= 15:
+        festivals.append("Fiscal year end (Ashad 31 ~mid-July): settlement rush, liquidity crunch.")
+
+    return {
+        "season":            "dry" if month in (3,4,5,11,12,1,2) else "wet",
+        "hydro_output":      hydro_note,
+        "remittance":        remit_note,
+        "festivals_nearby":  festivals or ["No major festival in next 2 weeks"],
+        "market_implication": (
+            "BUY hydro before monsoon for upcoming revenue surge" if month in (4,5)
+            else "Hydro at revenue peak — consider taking profits on high P/E hydro" if month in (8,9)
+            else "Stable season — fundamentals drive decisions"
+        ),
+    }
+
+
 def fetch_news() -> str:
     global _news_cache
     if time.time() - _news_cache["ts"] < NEWS_CACHE_TTL and _news_cache["data"]:
         return _news_cache["data"]
     news = []
+
+    # Source 1: surajrimal NepseAPI news (cloud-friendly)
+    try:
+        r = requests.get(
+            "https://nepseapi.surajrimal.dev/api/news",
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+            timeout=10
+        )
+        if r.ok:
+            d = r.json()
+            items = d if isinstance(d, list) else d.get("data") or []
+            for item in items[:5]:
+                t = item.get("title") or item.get("newsTitle") or item.get("heading", "")
+                if t:
+                    news.append(f"[nepse] {t}")
+    except Exception as e:
+        logger.warning(f"surajrimal news: {e}")
+
+    # Source 2: merolagani with mobile UA
     try:
         r = requests.get(
             "https://merolagani.com/handlers/webrequesthandler.ashx?type=latest_news&perPage=8",
-            headers={"User-Agent": "Mozilla/5.0"}, timeout=10
+            headers={"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15"},
+            timeout=10
         )
-        if r.ok:
+        if r.ok and r.text.strip().startswith("["):
             for item in r.json()[:5]:
                 t = item.get("newsTitle") or item.get("title", "")
                 if t:
@@ -848,6 +1240,170 @@ def sector_perf(stocks: list) -> dict:
                        "neutral"  if sum(ch) / len(ch) > -1   else "bearish"),
         "count": len(ch)
     } for sec, ch in sm.items()}
+
+
+# ─────────────────────────────────────────────────────
+# INTRADAY TREND TRACKING
+# Stores price/volume snapshots every cycle during market hours.
+# Builds a picture of HOW prices are moving, not just where they are.
+# ─────────────────────────────────────────────────────
+INTRADAY_FILE = "intraday.json"
+
+def intraday_load() -> dict:
+    data = load_json(INTRADAY_FILE, {})
+    today = get_nst().strftime("%Y-%m-%d")
+    # Reset if stale (new trading day)
+    if data.get("date") != today:
+        return {"date": today, "snapshots": [], "stocks": {}}
+    return data
+
+def intraday_save(data: dict):
+    atomic_write(INTRADAY_FILE, data)
+
+def intraday_record(stocks: list):
+    """Record a price/volume snapshot for every stock right now."""
+    data    = intraday_load()
+    now_str = get_nst().strftime("%H:%M")
+    snap    = {"time": now_str, "prices": {}}
+
+    for s in stocks:
+        sym = s.get("symbol", "")
+        if not sym:
+            continue
+        ltp = sf(s.get("ltp"))
+        vol = sf(s.get("volume"))
+        if ltp <= 0:
+            continue
+        snap["prices"][sym] = {"ltp": ltp, "vol": vol}
+
+        # Per-stock history
+        if sym not in data["stocks"]:
+            data["stocks"][sym] = []
+        data["stocks"][sym].append({"time": now_str, "ltp": ltp, "vol": vol})
+        # Keep last 48 snapshots per stock (covers full 4-hour session)
+        data["stocks"][sym] = data["stocks"][sym][-48:]
+
+    data["snapshots"].append(snap)
+    data["snapshots"] = data["snapshots"][-48:]
+    intraday_save(data)
+
+def intraday_trends(stocks: list) -> dict:
+    """
+    Compute intraday trend signals for each stock.
+    Returns dict: {symbol: {trend, momentum, vol_trend, reversals, signal}}
+    """
+    data = intraday_load()
+    result = {}
+
+    for s in stocks:
+        sym    = s.get("symbol", "")
+        if sym not in data["stocks"] or len(data["stocks"][sym]) < 3:
+            result[sym] = {"signal": "insufficient intraday data", "snapshots": 0}
+            continue
+
+        history = data["stocks"][sym]
+        prices  = [h["ltp"] for h in history]
+        vols    = [h["vol"] for h in history]
+        times   = [h["time"] for h in history]
+        n       = len(prices)
+
+        # Price trend: compare first third vs last third
+        first_avg = sum(prices[:n//3]) / max(1, n//3)
+        last_avg  = sum(prices[-(n//3):]) / max(1, n//3)
+        pct_move  = round((last_avg - first_avg) / first_avg * 100, 2) if first_avg > 0 else 0
+
+        # Volume trend: is volume building or dying?
+        first_vol = sum(vols[:n//3]) / max(1, n//3)
+        last_vol  = sum(vols[-(n//3):]) / max(1, n//3)
+        vol_ratio = round(last_vol / first_vol, 2) if first_vol > 0 else 1.0
+
+        # Count reversals (direction changes)
+        reversals = 0
+        for i in range(2, n):
+            prev_dir = prices[i-1] - prices[i-2]
+            curr_dir = prices[i]   - prices[i-1]
+            if prev_dir * curr_dir < 0:  # sign changed
+                reversals += 1
+
+        # Momentum: last 3 snapshots
+        recent_move = round((prices[-1] - prices[-3]) / prices[-3] * 100, 2) if n >= 3 and prices[-3] > 0 else 0
+
+        # Composite signal
+        if pct_move > 1.5 and vol_ratio > 1.2 and recent_move > 0:
+            signal = "STRONG UPTREND: rising price + building volume"
+        elif pct_move > 0.5 and recent_move > 0:
+            signal = "uptrend: gradual rise"
+        elif pct_move < -1.5 and vol_ratio > 1.2:
+            signal = "STRONG DOWNTREND: falling price + building volume (distribution)"
+        elif pct_move < -0.5:
+            signal = "downtrend: gradual decline"
+        elif reversals > n * 0.4:
+            signal = "choppy: high reversal count — avoid"
+        elif pct_move > 0 and vol_ratio < 0.7:
+            signal = "weak rally: price up but volume fading — caution"
+        else:
+            signal = "sideways: no clear trend"
+
+        result[sym] = {
+            "signal":       signal,
+            "pct_move":     pct_move,
+            "recent_move":  recent_move,
+            "vol_trend":    "building" if vol_ratio > 1.2 else ("fading" if vol_ratio < 0.8 else "stable"),
+            "vol_ratio":    vol_ratio,
+            "reversals":    reversals,
+            "snapshots":    n,
+            "first_price":  round(prices[0], 2),
+            "latest_price": round(prices[-1], 2),
+            "session_high": round(max(prices), 2),
+            "session_low":  round(min(prices), 2),
+            "open_time":    times[0],
+        }
+
+    return result
+
+def intraday_index_trend() -> dict:
+    """Track overall market (index) trend during the session."""
+    data = intraday_load()
+    snaps = data.get("snapshots", [])
+    if len(snaps) < 3:
+        return {"signal": "insufficient data", "snapshots": len(snaps)}
+
+    # Compute average market price movement across all stocks
+    moves = []
+    for i in range(1, len(snaps)):
+        prev = snaps[i-1]["prices"]
+        curr = snaps[i]["prices"]
+        common = set(prev.keys()) & set(curr.keys())
+        if common:
+            avg_move = sum(
+                (curr[s]["ltp"] - prev[s]["ltp"]) / prev[s]["ltp"] * 100
+                for s in common if prev[s]["ltp"] > 0
+            ) / len(common)
+            moves.append(avg_move)
+
+    if not moves:
+        return {"signal": "no data"}
+
+    avg_recent = sum(moves[-3:]) / len(moves[-3:])
+    avg_overall = sum(moves) / len(moves)
+
+    if avg_recent > 0.1 and avg_overall > 0:
+        market_trend = "BULLISH: market rising consistently"
+    elif avg_recent < -0.1 and avg_overall < 0:
+        market_trend = "BEARISH: market falling consistently"
+    elif avg_recent > 0.1 and avg_overall < 0:
+        market_trend = "RECOVERING: was down but now rising"
+    elif avg_recent < -0.1 and avg_overall > 0:
+        market_trend = "WEAKENING: was up but now falling"
+    else:
+        market_trend = "MIXED: no clear direction"
+
+    return {
+        "signal":       market_trend,
+        "recent_move":  round(avg_recent, 3),
+        "overall_move": round(avg_overall, 3),
+        "snapshots":    len(snaps),
+    }
 
 # ─────────────────────────────────────────────────────
 # NEPSE MARKET INTELLIGENCE
@@ -901,7 +1457,7 @@ Top buyers: if same brokers accumulating multiple days=serious signal.
 # ─────────────────────────────────────────────────────
 # AI PROMPTS (3 different lenses)
 # ─────────────────────────────────────────────────────
-def prompt_technical(stocks, fs_analysis, open_syms) -> str:
+def prompt_technical(stocks, fs_analysis, open_syms, context: dict = None) -> str:
     now = get_nst()
     top = sorted(stocks, key=lambda x: sf(x.get("volume")), reverse=True)[:20]
     enriched = []
@@ -937,36 +1493,64 @@ def prompt_technical(stocks, fs_analysis, open_syms) -> str:
             "floorsheet": s.get("floorsheet", {}),
         })
 
+    ctx    = context or {}
+    india  = ctx.get("india_market", {})
+    season = ctx.get("seasonal_context", {})
+    corp   = ctx.get("corporate_actions", [])
+    book_close_soon = [c for c in corp if 0 < c.get("days_until_close", 999) <= 7]
+
     return f"""You are a NEPSE technical analyst. {now.strftime('%A %B %d %Y, %I:%M %p NST')}
-Market: {market_status()} | T+2 settlement: {get_settlement_date()}
+Market: {market_status()} | Shares arrive: {get_settlement_date()}
 {NEPSE_CONTEXT}
+
+=== REAL-TIME SIGNALS ===
+India market (Nifty/Sensex): {json.dumps(india)}
+Nepal season: {season.get("season","?")} | Hydro: {season.get("hydro_output","?")}
+Remittance: {season.get("remittance","?")}
+Book closure within 7 days (pre-dividend rally): {json.dumps(book_close_soon)}
 
 TOP 10 STOCKS BY VOLUME WITH TECHNICAL INDICATORS + FLOORSHEET:
 {json.dumps(compact, indent=2)}
 
-YOUR FOCUS: Pure technical analysis.
-LOOK FOR: RSI 40-65 (not overbought), price>SMA20, MACD bullish, volume surge, NOT near upper circuit.
-CONFIRM with floorsheet: inst_net_flow>5% = institutional backing = higher conviction.
-FLAG: volume divergence, overbought (RSI>70), near upper circuit, downtrend.
-SKIP: stocks already in open positions, volume<2000, near circuit limits.
+YOUR FOCUS: Pure technical analysis with real-time context.
+LOOK FOR: RSI 40-65, price>SMA20, MACD bullish, volume surge, NOT near upper circuit.
+India bullish today = NEPSE likely follows = higher conviction on buys.
+India bearish today = be selective, raise bar, smaller position sizes.
+CONFIRM with floorsheet: inst_net_flow>5% = institutional backing.
+Pre-dividend stocks (book_close_soon) = strong buy signal if technically sound.
+SKIP: stocks in open positions, volume<2000, near circuits.
 
 RESPOND — valid JSON array only, zero extra text:
 [{{"symbol":"X","action":"BUY","current_price":100.0,"target_price":115.0,"stop_loss":92.0,
 "holding_period":"X days","confidence":"HIGH","risk":"LOW",
 "settlement_note":"Shares arrive [day] - safe/warning",
-"reasoning":"3 sentences: technical+floorsheet analysis",
+"reasoning":"3 sentences: technical + India market + seasonal context",
 "key_risk":"biggest risk","sector_catalyst":"driver","volume_note":"normal/high/surge",
 "min_quantity":10}}]"""
 
-def prompt_fundamental(stocks, news, sp, open_syms) -> str:
+def prompt_fundamental(stocks, news, sp, open_syms, context: dict = None) -> str:
     now = get_nst()
     filtered = [s for s in stocks if s.get("symbol", "") not in open_syms]
+    ctx    = context or {}
+    forex  = ctx.get("forex", {})
+    nrb    = ctx.get("nrb_signals", {})
+    politi = ctx.get("political_context", {})
+    season = ctx.get("seasonal_context", {})
+    corp   = ctx.get("corporate_actions", [])
+
     return f"""You are a NEPSE fundamental + macro analyst. {now.strftime('%A %B %d %Y, %I:%M %p NST')}
-Market: {market_status()} | T+2 settlement: {get_settlement_date()}
+Market: {market_status()} | Shares arrive: {get_settlement_date()}
 {NEPSE_CONTEXT}
 
+=== MACRO & FUNDAMENTAL SIGNALS ===
+Forex (USD/NPR, INR/NPR): {json.dumps(forex)}
+NRB monetary signals: {json.dumps(nrb)}
+Political context: {json.dumps(politi)}
+Seasonal context: {season.get('market_implication','unknown')} | {season.get('hydro_output','')}
+Upcoming corporate actions: {json.dumps(corp[:5])}
+
 SECTOR PERFORMANCE: {json.dumps(sp)}
-STOCK DATA: {json.dumps(filtered[:20], indent=2)}
+STOCK DATA: {json.dumps(filtered[:15], indent=2)}
 LATEST NEWS: {news}
 
 YOUR FOCUS: Fundamental value + macro tailwinds.
@@ -982,7 +1566,7 @@ RESPOND — valid JSON array only, zero extra text:
 "key_risk":"biggest risk","sector_catalyst":"driver","volume_note":"normal/high/surge",
 "min_quantity":10}}]"""
 
-def prompt_sentiment(stocks, news, fs_analysis, sp, open_syms) -> str:
+def prompt_sentiment(stocks, news, fs_analysis, sp, open_syms, context: dict = None) -> str:
     now = get_nst()
     # Rank by institutional activity
     ranked = sorted(
@@ -998,26 +1582,43 @@ def prompt_sentiment(stocks, news, fs_analysis, sp, open_syms) -> str:
         "top_buyers":    d.get("top_buyers", []),
     } for sym, d in list(fs_analysis.items())[:20]}
 
+    # Add intraday market context
+    ctx    = context or {}
+    india  = ctx.get("india_market", {})
+    season = ctx.get("seasonal_context", {})
+    politi = ctx.get("political_context", {})
+    corp   = ctx.get("corporate_actions", [])
+    book_close_soon = [c for c in corp if 0 < c.get("days_until_close", 999) <= 14]
+
     return f"""You are a NEPSE market sentiment + broker flow analyst. {now.strftime('%A %B %d %Y, %I:%M %p NST')}
-Market: {market_status()} | T+2 settlement: {get_settlement_date()}
+Market: {market_status()} | Shares arrive: {get_settlement_date()}
 {NEPSE_CONTEXT}
+
+=== SENTIMENT & GEOPOLITICAL SIGNALS ===
+India market (NEPSE correlates strongly): {json.dumps(india)}
+Nepal political mood: {politi.get('current_situation','unknown')}
+Key catalysts: {politi.get('upcoming_catalysts',[])}
+Season/remittance: {season.get('remittance','unknown')}
+Pre-dividend rally stocks (book close within 14 days): {json.dumps(book_close_soon)}
 
 SECTOR MOMENTUM: {json.dumps(sp)}
 FLOORSHEET INSTITUTIONAL FLOW: {json.dumps(fs_top, indent=2)}
 TOP STOCKS BY INSTITUTIONAL ACTIVITY: {json.dumps(ranked, indent=2)}
 LATEST NEWS: {news}
 
-YOUR FOCUS: Sentiment + momentum + broker flow intelligence.
-STRONG BUY: inst_net_flow>10% + positive news + sector tailwind.
-AVOID: institutional distribution (inst_net_flow<-10%) regardless of price action.
-Look for: momentum continuation, news catalysts, sector rotation, smart money accumulation.
+YOUR FOCUS: Sentiment + geopolitical + broker flow.
+STRONG BUY signals:
+  - inst_net_flow>10% (institutional accumulation) + India market bullish + positive news
+  - Book closure within 14 days + institutional buying = pre-dividend rally play
+  - Political clarity = market rally = buy market leaders
+AVOID: institutional distribution + India market down + negative news = perfect storm
 SKIP: stocks already in open positions.
 
 RESPOND — valid JSON array only, zero extra text:
 [{{"symbol":"X","action":"BUY","current_price":100.0,"target_price":115.0,"stop_loss":92.0,
 "holding_period":"X days","confidence":"HIGH","risk":"LOW",
 "settlement_note":"Shares arrive [day] - safe/warning",
-"reasoning":"3 sentences: sentiment+broker flow analysis",
+"reasoning":"3 sentences: sentiment+geopolitical+broker flow",
 "key_risk":"biggest risk","sector_catalyst":"driver","volume_note":"normal/high/surge",
 "min_quantity":10}}]"""
 
@@ -1045,7 +1646,12 @@ def parse_ai(text: str, src: str) -> list:
         logger.error(f"{src} parse: {ex} | {text[:200]}")
         return []
 
+_deepseek_disabled = False  # auto-disable if balance runs out
+
 def ask_deepseek(prompt: str) -> list:
+    global _deepseek_disabled
+    if _deepseek_disabled:
+        return []
     def call():
         r = requests.post(
             "https://api.deepseek.com/chat/completions",
@@ -1053,11 +1659,17 @@ def ask_deepseek(prompt: str) -> list:
             json={"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}],
                   "max_tokens": 2048, "temperature": 0.2},
             timeout=60)
+        if r.status_code == 402:
+            global _deepseek_disabled
+            _deepseek_disabled = True
+            logger.error("DeepSeek: Insufficient balance — disabling until recharged. Top up at platform.deepseek.com")
+            tg("⚠️ *DeepSeek balance empty!*\nTop up at platform.deepseek.com\nRunning on Gemini + Groq only.")
+            return []
         if not r.ok:
             raise Exception(f"HTTP {r.status_code}: {r.text[:200]}")
         return parse_ai(r.json()["choices"][0]["message"]["content"], "DeepSeek(Technical)")
     try:
-        return retry(call)
+        return retry(call, n=2)
     except Exception as e:
         logger.error(f"DeepSeek: {e}")
         return []
@@ -1065,7 +1677,7 @@ def ask_deepseek(prompt: str) -> list:
 def ask_gemini(prompt: str) -> list:
     def call():
         r = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
             json={"contents": [{"parts": [{"text": prompt}]}],
                   "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048}},
             timeout=60)
@@ -1391,6 +2003,7 @@ def run():
             # Update price history for TA
             if is_market_open() or is_preopen():
                 history_update(stocks)
+                intraday_record(stocks)  # record snapshot for trend analysis
 
             # Position monitoring (stop loss + target alerts)
             for alert in pos_monitor(stocks):
@@ -1422,25 +2035,35 @@ def run():
                         f"{len(stocks)} stocks | {len(floorsheet)} floorsheet trades | "
                         f"{len(fs_anal)} broker-analyzed stocks ===")
 
-            news = fetch_news()
+            news    = fetch_news()
+            context = fetch_realtime_context()
+            india   = context.get("india_market", {})
+            corp    = context.get("corporate_actions", [])
+            logger.info("Context: India={} | Forex keys={} | Corporate actions={}".format(
+                india.get("signal","?"),
+                list(context.get("forex",{}).keys()),
+                len(corp)
+            ))
 
             logger.info("DeepSeek → technical analysis...")
-            ds = ask_deepseek(prompt_technical(stocks, fs_anal, open_syms))
-            time.sleep(2)  # avoid simultaneous rate limits
+            ds = ask_deepseek(prompt_technical(stocks, fs_anal, open_syms, context))
+            time.sleep(2)
 
             logger.info("Gemini → fundamental analysis...")
-            gm = ask_gemini(prompt_fundamental(stocks, news, sp, open_syms))
+            gm = ask_gemini(prompt_fundamental(stocks, news, sp, open_syms, context))
             time.sleep(2)
 
             logger.info("Groq → sentiment + floorsheet...")
-            gr = ask_groq(prompt_sentiment(stocks, news, fs_anal, sp, open_syms))
+            gr = ask_groq(prompt_sentiment(stocks, news, fs_anal, sp, open_syms, context))
 
             logger.info(f"Votes → DS:{len(ds)} GM:{len(gm)} GR:{len(gr)}")
             final = vote(ds, gm, gr, fs_anal)
 
             if not final:
                 logger.info("No consensus.")
-                tg(f"🔍 Analysis #{cycles}: No consensus (AIs disagreed or poor R/R). Monitoring...")
+                # During market hours: only notify every 5th no-consensus to avoid spam
+                if not is_market_open() or cycles % 5 == 0:
+                    tg(f"🔍 Analysis #{cycles}: No consensus. Monitoring continuously...")
             else:
                 tg(f"📊 *Analysis #{cycles} Complete*\n🤝 {len(final)} consensus trade(s)! 👇")
                 for i, trade in enumerate(final):
@@ -1452,10 +2075,13 @@ def run():
                                 f"R/R=1:{trade['risk_reward']} {trade.get('votes')}")
                     time.sleep(2)
 
-            # ── Poll responses (10 min) ───────────────────
-            crashes = 0  # full cycle succeeded, reset crash counter
+            # ── Poll responses ────────────────────────────
+            # During market hours: poll for 3 min then re-analyze
+            # Outside market hours: poll for 10 min
+            crashes = 0
             heartbeat(f"Cycle #{cycles} — awaiting your response")
-            for _ in range(20):
+            poll_rounds = 6 if is_market_open() else 20  # 3 min vs 10 min
+            for _ in range(poll_rounds):
                 time.sleep(30)
                 responses, last_id = poll(last_id)
                 for resp in list(responses):
@@ -1497,25 +2123,53 @@ def run():
             # ── Next cycle timing ─────────────────────────
             # During market hours: run every hour
             # Outside market hours: run every 4 hours
-            # Smart sleep: use shorter interval if pre-open is approaching
-            now2 = get_nst()
+            # ── Sleep logic ──────────────────────────────────
+            now2  = get_nst()
+            today = now2.date()
+
             if is_market_open():
-                wait = 3600  # every hour during market
-            elif is_trading_day(now2.date()):
-                # How many minutes until pre-open (10:45)?
-                preopen_today = now2.replace(hour=10, minute=45, second=0, microsecond=0)
-                mins_to_preopen = (preopen_today - now2).total_seconds() / 60
-                if 0 < mins_to_preopen <= 240:
-                    # Wake up 5 min before pre-open
-                    wait = max(300, int(mins_to_preopen - 5) * 60)
+                # MARKET IS OPEN: run continuously, no sleep
+                # Each cycle takes ~2-3 min (AI calls), so effectively
+                # analyzing every few minutes throughout market hours
+                heartbeat(f"Cycle #{cycles} done — market open, restarting immediately")
+                # No tg() spam every cycle during market hours
+                # Just loop back immediately
+
+            elif is_trading_day(today):
+                # Today is a trading day but market is closed right now
+                market_open  = now2.replace(hour=11, minute=0, second=0, microsecond=0)
+                market_close = now2.replace(hour=15, minute=0, second=0, microsecond=0)
+
+                if now2 < market_open:
+                    # Before market opens: sleep until 11:00 AM sharp
+                    secs = max(30, int((market_open - now2).total_seconds()))
+                    nxt  = market_open
+                    heartbeat(f"Waiting for market open at 11:00 AM NST")
+                    tg(f"⏳ Market opens at 11:00 AM NST ({secs//60} min away). Will analyze continuously then.")
+                    time.sleep(secs)
                 else:
-                    wait = 14400  # 4 hours otherwise
+                    # After market closes (>3PM): sleep until tomorrow 11:00 AM
+                    tomorrow = today + timedelta(days=1)
+                    while not is_trading_day(tomorrow):
+                        tomorrow += timedelta(days=1)
+                    nxt  = datetime(tomorrow.year, tomorrow.month, tomorrow.day,
+                                    11, 0, 0, tzinfo=now2.tzinfo if hasattr(now2, 'tzinfo') else None)
+                    secs = max(60, int((nxt - now2).total_seconds()))
+                    heartbeat(f"Market closed. Next open: {tomorrow.strftime('%A %B %d')} 11AM")
+                    tg(f"🔴 Market closed for today. Next analysis: {tomorrow.strftime('%A, %B %d')} at 11:00 AM NST.")
+                    time.sleep(secs)
             else:
-                wait = 14400  # weekend/holiday
-            nxt = get_nst() + timedelta(seconds=wait)
-            heartbeat(f"Sleeping until {nxt.strftime('%I:%M %p NST')}")
-            tg(f"⏳ Next analysis: {nxt.strftime('%I:%M %p NST')} ({wait // 60} min)")
-            time.sleep(wait)
+                # Weekend or holiday: sleep until next trading day 11:00 AM
+                next_trading = today + timedelta(days=1)
+                while not is_trading_day(next_trading):
+                    next_trading += timedelta(days=1)
+                nxt  = datetime(next_trading.year, next_trading.month, next_trading.day,
+                                11, 0, 0, tzinfo=now2.tzinfo if hasattr(now2, 'tzinfo') else None)
+                secs = max(60, int((nxt - now2).total_seconds()))
+                day_name = next_trading.strftime("%A, %B %d")
+                heartbeat(f"Weekend/holiday. Next trading: {day_name}")
+                tg(f"📅 Market closed (weekend/holiday). Next trading day: {day_name} at 11:00 AM NST.")
+                time.sleep(secs)
 
         except KeyboardInterrupt:
             tg("🛑 Agent stopped manually. Goodbye!")
