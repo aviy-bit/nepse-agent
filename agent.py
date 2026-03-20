@@ -657,7 +657,26 @@ NEPSE_SYMBOLS = [
 def fetch_stocks() -> list:
     global _data_source
 
-    # Source 1: surajrimal07 NepseAPI (Oracle Cloud India - not blocked)
+    # Source 1: ShareBazaar Vercel CDN (globally distributed - best for Railway)
+    try:
+        r = requests.get(
+            "https://sharebazaar.vercel.app/api/zaan",
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+            timeout=15
+        )
+        if r.ok:
+            d = r.json()
+            stocks = d if isinstance(d, list) else d.get("data") or d.get("stocks") or []
+            valid = [normalize_stock(s) for s in (stocks if isinstance(stocks, list) else [])
+                     if sf(s.get("ltp") or s.get("lastTradedPrice") or s.get("close")) > 0]
+            if len(valid) >= 5:
+                logger.info(f"✅ ShareBazaar Vercel: {len(valid)} stocks")
+                _data_source = "ShareBazaar Vercel (live)"
+                return valid
+    except Exception as e:
+        logger.warning(f"ShareBazaar Vercel: {e}")
+
+    # Source 2: surajrimal07 NepseAPI (Oracle Cloud India - not blocked)
     try:
         r = requests.get(
             "https://nepseapi.surajrimal.dev/api/live",
@@ -999,9 +1018,10 @@ def fetch_forex() -> dict:
         )
         if r.ok:
             data = r.json()
-            rates = data.get("data",{}).get("payload",[])
+            payload = data.get("data") or {}
+            rates = payload.get("payload") or [] if isinstance(payload, dict) else []
             result = {}
-            for item in rates:
+            for item in (rates if isinstance(rates, list) else []):
                 cur = item.get("currency",{}).get("iso3","")
                 if cur in ("USD","INR"):
                     result[cur] = {
@@ -1027,10 +1047,10 @@ def fetch_corporate_actions() -> list:
             "https://merolagani.com/handlers/webrequesthandler.ashx?type=upcoming_dividends",
             headers={"User-Agent": "Mozilla/5.0"}, timeout=10
         )
-        if r.ok:
+        if r.ok and r.text.strip().startswith(("[","{")):
             data = r.json()
             items = data if isinstance(data, list) else data.get("data") or []
-            for item in items[:10]:
+            for item in (items[:10] if isinstance(items, list) else []):
                 symbol      = item.get("symbol") or item.get("stockSymbol","")
                 book_close  = item.get("bookCloseDate") or item.get("bookClose","")
                 dividend    = item.get("dividend") or item.get("cashDividend","")
@@ -1647,6 +1667,7 @@ def parse_ai(text: str, src: str) -> list:
         return []
 
 _deepseek_disabled = False  # auto-disable if balance runs out
+_gemini_backoff_until = 0.0  # timestamp until which Gemini is rate-limited
 
 def ask_deepseek(prompt: str) -> list:
     global _deepseek_disabled
@@ -1675,17 +1696,31 @@ def ask_deepseek(prompt: str) -> list:
         return []
 
 def ask_gemini(prompt: str) -> list:
+    global _gemini_backoff_until
+    if time.time() < _gemini_backoff_until:
+        remaining = int(_gemini_backoff_until - time.time())
+        logger.warning(f"Gemini rate-limited, skipping for {remaining}s")
+        return []
     def call():
         r = requests.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
             json={"contents": [{"parts": [{"text": prompt}]}],
                   "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048}},
             timeout=60)
+        if r.status_code == 429:
+            global _gemini_backoff_until
+            _gemini_backoff_until = time.time() + 300  # 5 min backoff
+            logger.warning("Gemini 429 rate limit — backing off 5 minutes")
+            tg("⚠️ Gemini rate limited (free tier). Backing off 5 min. Running on Groq only temporarily.")
+            return []
+        if r.status_code == 404:
+            logger.error("Gemini model not found — check API version")
+            return []
         if not r.ok:
             raise Exception(f"HTTP {r.status_code}: {r.text[:200]}")
         return parse_ai(r.json()["candidates"][0]["content"]["parts"][0]["text"], "Gemini(Fundamental)")
     try:
-        return retry(call)
+        return retry(call, n=2)
     except Exception as e:
         logger.error(f"Gemini: {e}")
         return []
@@ -2128,12 +2163,10 @@ def run():
             today = now2.date()
 
             if is_market_open():
-                # MARKET IS OPEN: run continuously, no sleep
-                # Each cycle takes ~2-3 min (AI calls), so effectively
-                # analyzing every few minutes throughout market hours
-                heartbeat(f"Cycle #{cycles} done — market open, restarting immediately")
-                # No tg() spam every cycle during market hours
-                # Just loop back immediately
+                # MARKET IS OPEN: run with minimum 3-min gap to avoid API rate limits
+                # Each AI cycle takes ~2min naturally, but add small buffer
+                heartbeat(f"Cycle #{cycles} done — restarting in 60s")
+                time.sleep(60)  # 1 min gap prevents rate limit hammering
 
             elif is_trading_day(today):
                 # Today is a trading day but market is closed right now
