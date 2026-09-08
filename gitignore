@@ -1,12 +1,14 @@
-# NEVER upload these to GitHub
+# Environment variables (API keys)
 .env
-*.env
+
+# Logs
 *.log
+
+# Cache and data files
 *.json
 __pycache__/
 *.pyc
 *.pyo
+
+# OS-specific
 .DS_Store
-price_history.json
-trades_log.json
-open_positions.json
