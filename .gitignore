@@ -1,0 +1,14 @@
+# Environment variables (API keys)
+.env
+
+# Logs
+*.log
+
+# Cache and data files
+*.json
+__pycache__/
+*.pyc
+*.pyo
+
+# OS-specific
+.DS_Store
